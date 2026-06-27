@@ -151,6 +151,13 @@ impl AssistantCliManager {
         }
     }
 
+    fn close_all(&mut self) {
+        let pane_ids = self.sessions.keys().cloned().collect::<Vec<_>>();
+        for pane_id in pane_ids {
+            self.close_session(&pane_id);
+        }
+    }
+
     fn send_input(&mut self, pane_id: &str, text: &str) -> Result<(), String> {
         let session = self
             .sessions
@@ -995,6 +1002,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     ) {
                         eprintln!("telescope tab snapshot save error: {error}");
                     }
+                    if let Ok(mut manager) = assistant_cli_manager.lock() {
+                        manager.close_all();
+                    }
                     *control_flow = ControlFlow::Exit;
                 }
             }
@@ -1416,7 +1426,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .current_url
             .as_deref()
             .ok_or_else(|| "active tab has no URL".to_string())?;
-        let origin = telescope_core::WebOrigin::from_url_str(url).map_err(|error| error.to_string())?;
+        let origin =
+            telescope_core::WebOrigin::from_url_str(url).map_err(|error| error.to_string())?;
         let seen_ref_ids = plane
             .list_element_references()
             .map_err(|error| error.to_string())?
@@ -4095,10 +4106,7 @@ fn default_cli_command() -> String {
 #[cfg(feature = "control-server")]
 fn sanitize_cli_command(input: &str) -> Option<String> {
     let input = input.trim();
-    if input.is_empty()
-        || input.len() > 512
-        || input.chars().any(|ch| matches!(ch, '\r' | '\n'))
-    {
+    if input.is_empty() || input.len() > 512 || input.chars().any(|ch| matches!(ch, '\r' | '\n')) {
         return None;
     }
     Some(input.to_string())
@@ -4535,6 +4543,17 @@ mod tests {
         assert!(normalize_codex_url("data:text/html,blocked").is_none());
         assert!(normalize_codex_url("codex example").is_none());
         assert!(normalize_codex_url("about:blank").is_none());
+    }
+
+    #[test]
+    fn cli_command_sanitizer_accepts_single_line_commands() {
+        assert_eq!(sanitize_cli_command(" codex ").as_deref(), Some("codex"));
+        assert_eq!(
+            sanitize_cli_command("claude --continue").as_deref(),
+            Some("claude --continue")
+        );
+        assert!(sanitize_cli_command("").is_none());
+        assert!(sanitize_cli_command("codex\nclaude").is_none());
     }
 
     #[test]
