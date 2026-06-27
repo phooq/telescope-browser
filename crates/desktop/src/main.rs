@@ -4084,6 +4084,26 @@ fn default_codex_url() -> Option<String> {
         .and_then(|url| normalize_codex_url(&url))
 }
 
+#[cfg(all(feature = "control-server", feature = "webview"))]
+fn default_cli_command() -> String {
+    std::env::var("TELESCOPE_AGENT_CLI")
+        .ok()
+        .and_then(|command| sanitize_cli_command(&command))
+        .unwrap_or_else(|| "codex".to_string())
+}
+
+#[cfg(feature = "control-server")]
+fn sanitize_cli_command(input: &str) -> Option<String> {
+    let input = input.trim();
+    if input.is_empty()
+        || input.len() > 512
+        || input.chars().any(|ch| matches!(ch, '\r' | '\n'))
+    {
+        return None;
+    }
+    Some(input.to_string())
+}
+
 #[cfg(feature = "control-server")]
 fn normalize_codex_url(input: &str) -> Option<String> {
     let input = input.trim();
@@ -5158,7 +5178,7 @@ mod tests {
                 x: 480,
                 y: BROWSER_CHROME_HEIGHT,
                 width: 640,
-                height: 508
+                height: 484
             }
         );
         assert_eq!(
@@ -5167,16 +5187,16 @@ mod tests {
                 x: 0,
                 y: BROWSER_CHROME_HEIGHT,
                 width: 480,
-                height: 508
+                height: 484
             }
         );
         assert_eq!(
             layout.workspace.pane_bounds("bottom").unwrap(),
             WorkspaceRect {
                 x: 0,
-                y: 746,
+                y: 758,
                 width: 1600,
-                height: 254
+                height: 242
             }
         );
     }
