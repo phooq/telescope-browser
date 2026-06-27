@@ -545,7 +545,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 return self.activate_tab(&tab.id);
             }
 
-            let initial_bounds = browser_bounds_for_tabs(self.main_window, self.agent_panes);
+            let initial_bounds = browser_bounds_for_tabs(
+                self.main_window,
+                self.agent_panes,
+                self.assistant_cli_panes,
+            );
             let webview = build_browser_tab_webview(
                 self.browser_context,
                 self.plane,
@@ -666,9 +670,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 return result;
             }
 
-            let initial_bounds = layout_for_new_pane(self.main_window, self.agent_panes, pane)
-                .pane_bounds(&pane.id)
-                .unwrap_or_else(|| workspace_surface(self.main_window.inner_size()).into());
+            let initial_bounds = layout_for_new_pane(
+                self.main_window,
+                self.agent_panes,
+                self.assistant_cli_panes,
+                pane,
+            )
+            .pane_bounds(&pane.id)
+            .unwrap_or_else(|| workspace_surface(self.main_window.inner_size()).into());
             let builder = WebViewBuilder::new_with_web_context(self.agent_context)
                 .with_user_agent("Telescope/0.1")
                 .with_initialization_script(agent_connection_script(
@@ -797,7 +806,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut assistant_cli_panes = Vec::new();
     let mut keyboard_modifiers = tao::keyboard::ModifiersState::empty();
     for restored_tab in registered_tabs.iter().skip(1) {
-        let bounds = browser_bounds_for_tabs(&window, &agent_panes);
+        let bounds = browser_bounds_for_tabs(&window, &agent_panes, &assistant_cli_panes);
         let webview = build_browser_tab_webview(
             &mut browser_context,
             &plane,
@@ -865,6 +874,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 drop(sink);
                 let cli_opens = drain_pending_cli_opens(&pending_assistant_cli_opens);
+                let mut opened_cli_pane = false;
                 for request in cli_opens {
                     match open_assistant_cli_pane(
                         &window,
@@ -876,8 +886,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         &agent_panes,
                         &assistant_cli_panes,
                     ) {
-                        Ok(pane) => assistant_cli_panes.push(pane),
+                        Ok(pane) => {
+                            assistant_cli_panes.push(pane);
+                            opened_cli_pane = true;
+                        }
                         Err(error) => eprintln!("telescope CLI pane open error: {error}"),
+                    }
+                }
+                if opened_cli_pane {
+                    if let Err(error) = relayout_workspace(
+                        &window,
+                        &active_tab_id,
+                        &tab.id,
+                        &webview,
+                        &browser_tabs,
+                        &agent_panes,
+                        &assistant_cli_panes,
+                    ) {
+                        eprintln!("telescope workspace layout error: {error}");
                     }
                 }
                 if let Ok(refs) = plane.list_element_references() {
@@ -1261,9 +1287,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     fn layout_for_new_pane(
         window: &Window,
         agent_panes: &[AgentPaneView],
+        assistant_cli_panes: &[AssistantCliPaneView],
         pane: &AgentPaneState,
     ) -> WorkspaceLayout {
-        let mut panes = pane_layout_inputs(agent_panes);
+        let mut panes = pane_layout_inputs(agent_panes, assistant_cli_panes);
         panes.push(PaneLayoutInput {
             id: pane.id.clone(),
             position: pane.position.clone(),
@@ -1278,10 +1305,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         browser_webview: &WebView,
         browser_tabs: &[BrowserTabView],
         agent_panes: &[AgentPaneView],
+        assistant_cli_panes: &[AssistantCliPaneView],
     ) -> RuntimeResult<()> {
         let layout = compute_desktop_layout(
             workspace_surface(window.inner_size()),
-            pane_layout_inputs(agent_panes),
+            pane_layout_inputs(agent_panes, assistant_cli_panes),
         )
         .workspace;
         apply_browser_tab_layout(
@@ -1303,14 +1331,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 set_webview_bounds(&pane.webview, bounds)?;
             }
         }
+        for pane in assistant_cli_panes {
+            if let Some(bounds) = layout.pane_bounds(&pane.id) {
+                set_webview_bounds(&pane.webview, bounds)?;
+            }
+        }
 
         Ok(())
     }
 
-    fn browser_bounds_for_tabs(window: &Window, agent_panes: &[AgentPaneView]) -> WorkspaceRect {
+    fn browser_bounds_for_tabs(
+        window: &Window,
+        agent_panes: &[AgentPaneView],
+        assistant_cli_panes: &[AssistantCliPaneView],
+    ) -> WorkspaceRect {
         compute_desktop_layout(
             workspace_surface(window.inner_size()),
-            pane_layout_inputs(agent_panes),
+            pane_layout_inputs(agent_panes, assistant_cli_panes),
         )
         .workspace
         .browser
@@ -1328,13 +1365,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Ok(())
     }
 
-    fn pane_layout_inputs(agent_panes: &[AgentPaneView]) -> Vec<PaneLayoutInput> {
+    fn pane_layout_inputs(
+        agent_panes: &[AgentPaneView],
+        assistant_cli_panes: &[AssistantCliPaneView],
+    ) -> Vec<PaneLayoutInput> {
         agent_panes
             .iter()
             .map(|pane| PaneLayoutInput {
                 id: pane.id.clone(),
                 position: pane.position.clone(),
             })
+            .chain(assistant_cli_panes.iter().map(|pane| PaneLayoutInput {
+                id: pane.id.clone(),
+                position: pane.position.clone(),
+            }))
             .collect()
     }
 
