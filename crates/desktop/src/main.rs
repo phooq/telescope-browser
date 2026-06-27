@@ -1002,7 +1002,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    fn handle_chrome_ipc_request(plane: &ControlPlane, body: &str) {
+    fn handle_chrome_ipc_request(
+        plane: &ControlPlane,
+        pending_cli_opens: &Arc<Mutex<Vec<PendingAssistantCliOpen>>>,
+        body: &str,
+    ) {
         let Ok(value) = serde_json::from_str::<serde_json::Value>(body) else {
             return;
         };
@@ -1176,6 +1180,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     eprintln!("telescope chrome open agent pane error: {error}");
                 }
             }
+            Some("telescope.chrome.open_cli_pane") => {
+                let Some(command) = value
+                    .get("command")
+                    .and_then(|item| item.as_str())
+                    .and_then(sanitize_cli_command)
+                else {
+                    return;
+                };
+                let Some(position) = value
+                    .get("position")
+                    .and_then(|item| item.as_str())
+                    .and_then(parse_pane_position)
+                else {
+                    return;
+                };
+                if let Ok(mut pending) = pending_cli_opens.lock() {
+                    pending.push(PendingAssistantCliOpen { command, position });
+                }
+            }
             Some("telescope.chrome.stop_agent_pane") => {
                 let Some(pane_id) = value.get("pane_id").and_then(|item| item.as_str()) else {
                     return;
@@ -1262,6 +1285,222 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 eprintln!("telescope page context script error: {error}");
             }
         }
+    }
+
+    fn drain_pending_cli_opens(
+        pending: &Arc<Mutex<Vec<PendingAssistantCliOpen>>>,
+    ) -> Vec<PendingAssistantCliOpen> {
+        pending
+            .lock()
+            .map(|mut pending| std::mem::take(&mut *pending))
+            .unwrap_or_default()
+    }
+
+    fn drain_pending_cli_closes(pending: &Arc<Mutex<Vec<String>>>) -> Vec<String> {
+        pending
+            .lock()
+            .map(|mut pending| std::mem::take(&mut *pending))
+            .unwrap_or_default()
+    }
+
+    fn open_assistant_cli_pane(
+        window: &Window,
+        workspace_host: &DesktopWorkspaceHost,
+        plane: &ControlPlane,
+        manager: Arc<Mutex<AssistantCliManager>>,
+        pending_closes: Arc<Mutex<Vec<String>>>,
+        request: PendingAssistantCliOpen,
+        agent_panes: &[AgentPaneView],
+        assistant_cli_panes: &[AssistantCliPaneView],
+    ) -> RuntimeResult<AssistantCliPaneView> {
+        let pane_id = manager
+            .lock()
+            .map_err(|_| {
+                telescope_runtime::RuntimeError::Adapter(
+                    "assistant CLI manager lock poisoned".to_string(),
+                )
+            })?
+            .open_session(&request.command);
+        let bounds = layout_for_new_cli_pane(
+            window,
+            agent_panes,
+            assistant_cli_panes,
+            &pane_id,
+            request.position.clone(),
+        )
+        .pane_bounds(&pane_id)
+        .unwrap_or_else(|| workspace_surface(window.inner_size()).into());
+        let plane_for_ipc = plane.clone();
+        let manager_for_ipc = manager.clone();
+        let pending_closes_for_ipc = pending_closes.clone();
+        let builder = WebViewBuilder::new()
+            .with_user_agent("Telescope/0.1")
+            .with_ipc_handler(move |request| {
+                handle_assistant_cli_ipc_request(
+                    &plane_for_ipc,
+                    &manager_for_ipc,
+                    &pending_closes_for_ipc,
+                    request.body(),
+                );
+            })
+            .with_html(assistant_cli_pane_html(&pane_id, &request.command))
+            .with_general_autofill_enabled(false);
+        let webview = build_workspace_webview(builder, window, workspace_host, bounds)
+            .map_err(|err| telescope_runtime::RuntimeError::Adapter(err.to_string()))?;
+        Ok(AssistantCliPaneView {
+            id: pane_id,
+            position: request.position,
+            webview,
+        })
+    }
+
+    fn handle_assistant_cli_ipc_request(
+        plane: &ControlPlane,
+        manager: &Arc<Mutex<AssistantCliManager>>,
+        pending_closes: &Arc<Mutex<Vec<String>>>,
+        body: &str,
+    ) {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(body) else {
+            return;
+        };
+        let Some(pane_id) = value.get("pane_id").and_then(|item| item.as_str()) else {
+            return;
+        };
+        let result = match value.get("type").and_then(|item| item.as_str()) {
+            Some("telescope.cli.input") => {
+                let Some(text) = value.get("text").and_then(|item| item.as_str()) else {
+                    return;
+                };
+                manager
+                    .lock()
+                    .map_err(|_| "assistant CLI manager lock poisoned".to_string())
+                    .and_then(|mut manager| manager.send_input(pane_id, text))
+            }
+            Some("telescope.cli.pick_element") => start_cli_element_pick(plane, manager, pane_id),
+            Some("telescope.cli.add_selection") => manager
+                .lock()
+                .map_err(|_| "assistant CLI manager lock poisoned".to_string())
+                .and_then(|mut manager| manager.add_selection_to_chat(pane_id)),
+            Some("telescope.cli.add_page_context") => {
+                let context = active_page_context(plane);
+                manager
+                    .lock()
+                    .map_err(|_| "assistant CLI manager lock poisoned".to_string())
+                    .and_then(|mut manager| manager.add_page_context_to_chat(pane_id, context))
+            }
+            Some("telescope.cli.close") => {
+                if let Ok(mut pending) = pending_closes.lock() {
+                    pending.push(pane_id.to_string());
+                }
+                Ok(())
+            }
+            _ => Ok(()),
+        };
+        if let Err(error) = result {
+            if let Ok(mut manager) = manager.lock() {
+                manager.note(pane_id, &format!("\r\n[Telescope] {error}\r\n"));
+            }
+        }
+    }
+
+    fn start_cli_element_pick(
+        plane: &ControlPlane,
+        manager: &Arc<Mutex<AssistantCliManager>>,
+        pane_id: &str,
+    ) -> Result<(), String> {
+        let tab = plane
+            .active_tab()
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "no active tab".to_string())?;
+        let url = tab
+            .current_url
+            .as_deref()
+            .ok_or_else(|| "active tab has no URL".to_string())?;
+        let origin = telescope_core::WebOrigin::from_url_str(url).map_err(|error| error.to_string())?;
+        let seen_ref_ids = plane
+            .list_element_references()
+            .map_err(|error| error.to_string())?
+            .into_iter()
+            .filter(|reference| reference.tab_id == tab.id)
+            .map(|reference| reference.id)
+            .collect::<BTreeSet<_>>();
+        let session = plane
+            .create_session(CreateSessionRequest {
+                allowed_origins: vec![origin.display_url()],
+                allow_credentials: false,
+                allow_interactions: true,
+                allow_scripts: false,
+                ttl_seconds: Some(60 * 60),
+            })
+            .map_err(|error| error.to_string())?;
+        plane
+            .queue_agent_action(
+                &tab.id,
+                AgentActionRequest {
+                    session_id: session.id,
+                    action: AgentAction::StartElementPicker,
+                },
+            )
+            .map_err(|error| error.to_string())?;
+        manager
+            .lock()
+            .map_err(|_| "assistant CLI manager lock poisoned".to_string())?
+            .start_pick(pane_id, tab.id, seen_ref_ids)
+    }
+
+    fn active_page_context(plane: &ControlPlane) -> Option<telescope_control::PageContextSnapshot> {
+        let active_tab_id = plane.active_tab().ok().flatten()?.id;
+        plane
+            .list_page_contexts()
+            .ok()?
+            .into_iter()
+            .find(|context| context.tab_id == active_tab_id)
+    }
+
+    fn sync_assistant_cli_panes(
+        manager: &Arc<Mutex<AssistantCliManager>>,
+        panes: &[AssistantCliPaneView],
+    ) {
+        let Ok(mut manager) = manager.lock() else {
+            return;
+        };
+        for pane in panes {
+            let output = manager.drain_output(&pane.id);
+            if !output.is_empty() {
+                let script = format!(
+                    "window.__TELESCOPE_TERMINAL_APPEND && window.__TELESCOPE_TERMINAL_APPEND({});",
+                    serde_json_string(&output)
+                );
+                if let Err(error) = pane.webview.evaluate_script(&script) {
+                    eprintln!("telescope CLI pane output error: {error}");
+                }
+            }
+            let state = manager.state_json(&pane.id);
+            let Ok(state) = serde_json::to_string(&state) else {
+                continue;
+            };
+            let script = format!(
+                "window.__TELESCOPE_TERMINAL_SET_STATE && window.__TELESCOPE_TERMINAL_SET_STATE({state});"
+            );
+            if let Err(error) = pane.webview.evaluate_script(&script) {
+                eprintln!("telescope CLI pane state error: {error}");
+            }
+        }
+    }
+
+    fn layout_for_new_cli_pane(
+        window: &Window,
+        agent_panes: &[AgentPaneView],
+        assistant_cli_panes: &[AssistantCliPaneView],
+        pane_id: &str,
+        position: PanePosition,
+    ) -> WorkspaceLayout {
+        let mut panes = pane_layout_inputs(agent_panes, assistant_cli_panes);
+        panes.push(PaneLayoutInput {
+            id: pane_id.to_string(),
+            position,
+        });
+        compute_desktop_layout(workspace_surface(window.inner_size()), panes).workspace
     }
 
     fn build_browser_tab_webview(
@@ -1522,6 +1761,183 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Ok(agent_connection_script_source(&payload))
     }
 
+    fn assistant_cli_pane_html(pane_id: &str, command: &str) -> String {
+        let pane_id = serde_json::to_string(pane_id).unwrap_or_else(|_| "\"\"".to_string());
+        let command = serde_json::to_string(command).unwrap_or_else(|_| "\"codex\"".to_string());
+        format!(
+            r#"<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+:root {{
+  color-scheme: dark;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+  font-size: 12px;
+}}
+* {{ box-sizing: border-box; }}
+body {{
+  margin: 0;
+  height: 100vh;
+  display: grid;
+  grid-template-rows: 34px minmax(0, 1fr) 34px;
+  background: #11161d;
+  color: #d8dee9;
+}}
+.bar {{
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  padding: 4px 6px;
+  border-bottom: 1px solid #2c3440;
+  background: #171d25;
+}}
+.title {{
+  flex: 1 1 auto;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  color: #f0f3f7;
+  font-weight: 600;
+}}
+button {{
+  flex: 0 0 auto;
+  height: 26px;
+  border: 1px solid #3a4654;
+  border-radius: 5px;
+  padding: 0 8px;
+  background: #202833;
+  color: #e6edf3;
+  font: inherit;
+}}
+button:disabled {{
+  color: #798493;
+  background: #171d25;
+}}
+button:hover:not(:disabled) {{ background: #2a3441; }}
+#terminal-output {{
+  margin: 0;
+  padding: 8px;
+  overflow: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+  line-height: 1.35;
+}}
+.input {{
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 54px;
+  gap: 6px;
+  padding: 4px 6px;
+  border-top: 1px solid #2c3440;
+  background: #171d25;
+}}
+#terminal-input {{
+  min-width: 0;
+  height: 26px;
+  border: 1px solid #3a4654;
+  border-radius: 5px;
+  padding: 0 8px;
+  background: #0d1117;
+  color: #e6edf3;
+  font: inherit;
+}}
+.selection {{
+  flex: 0 1 220px;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  color: #9fb3c8;
+}}
+</style>
+</head>
+<body>
+  <div class="bar">
+    <div id="title" class="title"></div>
+    <div id="selection" class="selection"></div>
+    <button id="pick" type="button">Pick</button>
+    <button id="add-selection" type="button" disabled>Add selection</button>
+    <button id="add-page" type="button">Add page</button>
+    <button id="close" type="button">Close</button>
+  </div>
+  <pre id="terminal-output"></pre>
+  <form id="input-form" class="input">
+    <input id="terminal-input" autocomplete="off" spellcheck="false">
+    <button type="submit">Send</button>
+  </form>
+<script>
+const paneId = {pane_id};
+const command = {command};
+const titleEl = document.getElementById('title');
+const selectionEl = document.getElementById('selection');
+const outputEl = document.getElementById('terminal-output');
+const formEl = document.getElementById('input-form');
+const inputEl = document.getElementById('terminal-input');
+const pickEl = document.getElementById('pick');
+const addSelectionEl = document.getElementById('add-selection');
+const addPageEl = document.getElementById('add-page');
+const closeEl = document.getElementById('close');
+titleEl.textContent = `CLI: ${{command}}`;
+
+function post(type, payload = {{}}) {{
+  window.ipc.postMessage(JSON.stringify({{ type, pane_id: paneId, ...payload }}));
+}}
+
+function cleanTerminalText(text) {{
+  return String(text || '')
+    .replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, '')
+    .replace(/\x1b\][^\x07]*(\x07|\x1b\\)/g, '');
+}}
+
+function appendOutput(text) {{
+  outputEl.textContent += cleanTerminalText(text);
+  if (outputEl.textContent.length > 180000) {{
+    outputEl.textContent = outputEl.textContent.slice(-140000);
+  }}
+  outputEl.scrollTop = outputEl.scrollHeight;
+}}
+
+window.__TELESCOPE_TERMINAL_APPEND = appendOutput;
+window.__TELESCOPE_TERMINAL_SET_STATE = (state) => {{
+  if (state?.selection) {{
+    selectionEl.textContent = state.selection.summary || state.selection.selector || 'selected';
+    selectionEl.title = state.selection.selector || '';
+    addSelectionEl.disabled = false;
+  }} else {{
+    selectionEl.textContent = state?.pending_pick ? 'Picking...' : '';
+    selectionEl.title = '';
+    addSelectionEl.disabled = true;
+  }}
+  pickEl.disabled = Boolean(state?.pending_pick);
+}};
+
+formEl.addEventListener('submit', (event) => {{
+  event.preventDefault();
+  const text = inputEl.value;
+  if (!text) return;
+  post('telescope.cli.input', {{ text: `${{text}}\r` }});
+  inputEl.value = '';
+}});
+
+inputEl.addEventListener('keydown', (event) => {{
+  if (event.key === 'Escape') {{
+    event.preventDefault();
+    post('telescope.cli.input', {{ text: '\x03' }});
+  }}
+}});
+
+pickEl.addEventListener('click', () => post('telescope.cli.pick_element'));
+addSelectionEl.addEventListener('click', () => post('telescope.cli.add_selection'));
+addPageEl.addEventListener('click', () => post('telescope.cli.add_page_context'));
+closeEl.addEventListener('click', () => post('telescope.cli.close'));
+inputEl.focus();
+</script>
+</body>
+</html>"#
+        )
+    }
+
     fn browser_chrome_html() -> String {
         r#"<!doctype html>
 <html>
@@ -1543,10 +1959,10 @@ body {
   color: #1f2933;
 }
 .chrome {
-  height: 238px;
+  height: 274px;
   display: grid;
   grid-template-columns: minmax(0, 1fr);
-  grid-template-rows: 30px 30px 30px 30px 30px 48px;
+  grid-template-rows: 30px 30px 30px 30px 30px 30px 48px;
   gap: 6px;
   align-items: center;
   padding: 5px 8px;
@@ -1631,6 +2047,13 @@ button:hover { background: #ffffff; }
   gap: 6px;
   min-width: 0;
 }
+.cli {
+  grid-column: 1 / -1;
+  display: grid;
+  grid-template-columns: minmax(160px, 1fr) 96px 86px;
+  gap: 6px;
+  min-width: 0;
+}
 .panes {
   grid-column: 1 / -1;
   display: grid;
@@ -1698,7 +2121,9 @@ button:hover { background: #ffffff; }
 .credential-select,
 .credential-input,
 .agent-url,
+.cli-command,
 .agent-position,
+.cli-position,
 .pane-select,
 .bookmark-select {
   width: 100%;
@@ -1771,6 +2196,15 @@ button:hover { background: #ffffff; }
       <label class="agent-option" title="Read-only pane"><input id="agent-read-only" type="checkbox"><span>Read</span></label>
       <button id="open-agent" type="submit" title="Open Codex pane">Open</button>
     </form>
+    <form id="cli" class="cli">
+      <input id="cli-command" class="cli-command" autocomplete="off" spellcheck="false" placeholder="codex or claude">
+      <select id="cli-position" class="cli-position" title="CLI pane edge">
+        <option value="right">Right</option>
+        <option value="left">Left</option>
+        <option value="bottom">Bottom</option>
+      </select>
+      <button id="open-cli" type="submit" title="Open local CLI pane">Open CLI</button>
+    </form>
     <div id="panes" class="panes">
       <select id="agent-pane-select" class="pane-select" title="Open Codex panes"></select>
       <button id="stop-agent-pane" type="button" title="Stop selected Codex pane">Stop</button>
@@ -1810,6 +2244,14 @@ const auditListEl = document.getElementById('audit-list');
 const defaultAgentUrl = __TELESCOPE_DEFAULT_CODEX_URL_JSON__;
 if (defaultAgentUrl && !agentUrlEl.value) {
   agentUrlEl.value = defaultAgentUrl;
+}
+const defaultCliCommand = __TELESCOPE_DEFAULT_CLI_COMMAND_JSON__;
+const cliEl = document.getElementById('cli');
+const cliCommandEl = document.getElementById('cli-command');
+const cliPositionEl = document.getElementById('cli-position');
+const openCliEl = document.getElementById('open-cli');
+if (defaultCliCommand && !cliCommandEl.value) {
+  cliCommandEl.value = defaultCliCommand;
 }
 let state = { active_tab_id: null, tabs: [], credentials: [], panes: [], bookmarks: [], audit_events: [] };
 let renderedActiveTabId = null;
@@ -2022,6 +2464,7 @@ function render() {
   agentInteractionsEl.disabled = !hasActiveTab || agentReadOnlyEl.checked;
   agentScriptsEl.disabled = !hasActiveTab || agentReadOnlyEl.checked;
   openAgentEl.disabled = !hasActiveTab;
+  openCliEl.disabled = !cliCommandEl.value.trim();
   agentPaneSelectEl.disabled = !hasPane;
   stopAgentPaneEl.disabled = !hasPane;
 
@@ -2149,6 +2592,16 @@ agentEl.addEventListener('submit', (event) => {
   });
 });
 
+cliCommandEl.addEventListener('input', () => render());
+
+cliEl.addEventListener('submit', (event) => {
+  event.preventDefault();
+  const command = cliCommandEl.value.trim();
+  const position = cliPositionEl.value;
+  if (!command || !position) return;
+  post('telescope.chrome.open_cli_pane', { command, position });
+});
+
 stopAgentPaneEl.addEventListener('click', () => {
   const pane_id = agentPaneSelectEl.value;
   if (!pane_id) return;
@@ -2169,11 +2622,16 @@ render();
                 &serde_json::to_string(&default_codex_url())
                     .unwrap_or_else(|_| "null".to_string()),
             )
+            .replace(
+                "__TELESCOPE_DEFAULT_CLI_COMMAND_JSON__",
+                &serde_json::to_string(&default_cli_command())
+                    .unwrap_or_else(|_| "\"codex\"".to_string()),
+            )
     }
 }
 
 #[cfg(feature = "control-server")]
-const BROWSER_CHROME_HEIGHT: u32 = 238;
+const BROWSER_CHROME_HEIGHT: u32 = 274;
 #[cfg(feature = "control-server")]
 const DESKTOP_TABS_FILE: &str = "tabs.json";
 #[cfg(feature = "control-server")]
