@@ -1,0 +1,17 @@
+[package]
+name = "telescope-sdk"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+telescope-control = { path = "../control" }
+telescope-core = { path = "../browser-core", default-features = false }
+ureq.workspace = true
+
+[dev-dependencies]
+tiny_http.workspace = true

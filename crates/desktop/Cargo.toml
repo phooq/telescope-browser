@@ -1,0 +1,47 @@
+[package]
+name = "telescope-desktop"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[features]
+default = []
+control-server = [
+    "dep:serde",
+    "dep:serde_json",
+    "dep:telescope-control",
+    "dep:telescope-core",
+    "dep:tiny_http",
+    "dep:uuid",
+]
+webview = [
+    "control-server",
+    "dep:directories",
+    "dep:gtk",
+    "dep:portable-pty",
+    "dep:tao",
+    "dep:telescope-core",
+    "dep:telescope-runtime",
+    "dep:wry",
+]
+
+[[bin]]
+name = "telescope-browser"
+path = "src/main.rs"
+
+[dependencies]
+directories = { workspace = true, optional = true }
+portable-pty = { version = "0.9.0", optional = true }
+serde = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true }
+tao = { workspace = true, optional = true, default-features = false, features = ["rwh_06", "x11"] }
+telescope-control = { path = "../control", optional = true }
+telescope-core = { path = "../browser-core", optional = true }
+telescope-runtime = { path = "../runtime", optional = true }
+tiny_http = { workspace = true, optional = true }
+uuid = { workspace = true, optional = true }
+wry = { workspace = true, optional = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+gtk = { version = "0.18.2", optional = true }
