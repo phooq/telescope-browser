@@ -511,6 +511,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         browser_tabs: &'a mut Vec<BrowserTabView>,
         agent_panes: &'a mut Vec<AgentPaneView>,
         assistant_cli_panes: &'a [AssistantCliPaneView],
+        surface: WorkspaceSurface,
     }
 
     impl WebViewSink<'_> {
@@ -552,11 +553,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 return self.activate_tab(&tab.id);
             }
 
-            let initial_bounds = browser_bounds_for_tabs(
-                self.main_window,
-                self.agent_panes,
-                self.assistant_cli_panes,
-            );
+            let initial_bounds =
+                browser_bounds_for_tabs(self.surface, self.agent_panes, self.assistant_cli_panes);
             let webview = build_browser_tab_webview(
                 self.browser_context,
                 self.plane,
@@ -599,6 +597,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     self.browser_tabs,
                     self.agent_panes,
                     self.assistant_cli_panes,
+                    self.surface,
                 )?;
             }
             Ok(())
@@ -615,6 +614,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 self.browser_tabs,
                 self.agent_panes,
                 self.assistant_cli_panes,
+                self.surface,
             )
         }
 
@@ -673,18 +673,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     self.browser_tabs,
                     self.agent_panes,
                     self.assistant_cli_panes,
+                    self.surface,
                 )?;
                 return result;
             }
 
             let initial_bounds = layout_for_new_pane(
                 self.main_window,
+                self.surface,
                 self.agent_panes,
                 self.assistant_cli_panes,
                 pane,
             )
             .pane_bounds(&pane.id)
-            .unwrap_or_else(|| workspace_surface(self.main_window.inner_size()).into());
+            .unwrap_or_else(|| self.surface.into());
             let builder = WebViewBuilder::new_with_web_context(self.agent_context)
                 .with_user_agent("Telescope/0.1")
                 .with_initialization_script(agent_connection_script(
@@ -715,6 +717,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 self.browser_tabs,
                 self.agent_panes,
                 self.assistant_cli_panes,
+                self.surface,
             )
         }
 
@@ -729,6 +732,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     self.browser_tabs,
                     self.agent_panes,
                     self.assistant_cli_panes,
+                    self.surface,
                 )?;
             }
             Ok(())
@@ -773,6 +777,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_title("Telescope")
         .build(&event_loop)?;
     let workspace_host = DesktopWorkspaceHost::new(&window)?;
+    let mut current_surface = workspace_surface(window.inner_size());
+    workspace_host.resize(current_surface);
     let mut browser_context = WebContext::new(Some(profile_dir.join("webview")));
     let mut agent_context = WebContext::new(Some(profile_dir.join("agent-webview")));
     let assistant_cli_manager = Arc::new(Mutex::new(AssistantCliManager::new()));
@@ -795,7 +801,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         chrome_builder,
         &window,
         &workspace_host,
-        chrome_bounds_for_window(&window),
+        chrome_bounds_for_surface(current_surface),
     )?;
     let webview = build_browser_tab_webview(
         &mut browser_context,
@@ -803,7 +809,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         &window,
         &workspace_host,
         &tab,
-        workspace_surface(window.inner_size()).into(),
+        current_surface.into(),
     )?;
     let mut active_tab_id = restored_active_tab_id;
     let mut last_context_capture = Instant::now() - Duration::from_secs(2);
@@ -813,7 +819,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut assistant_cli_panes = Vec::new();
     let mut keyboard_modifiers = tao::keyboard::ModifiersState::empty();
     for restored_tab in registered_tabs.iter().skip(1) {
-        let bounds = browser_bounds_for_tabs(&window, &agent_panes, &assistant_cli_panes);
+        let bounds = browser_bounds_for_tabs(current_surface, &agent_panes, &assistant_cli_panes);
         let webview = build_browser_tab_webview(
             &mut browser_context,
             &plane,
@@ -835,6 +841,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         &browser_tabs,
         &agent_panes,
         &assistant_cli_panes,
+        current_surface,
     )?;
 
     event_loop.run(move |event, _event_loop, control_flow| {
@@ -857,6 +864,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         &browser_tabs,
                         &agent_panes,
                         &assistant_cli_panes,
+                        current_surface,
                     ) {
                         eprintln!("telescope workspace layout error: {error}");
                     }
@@ -875,6 +883,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     browser_tabs: &mut browser_tabs,
                     agent_panes: &mut agent_panes,
                     assistant_cli_panes: &assistant_cli_panes,
+                    surface: current_surface,
                 };
                 if let Err(error) = runtime.apply_pending(None, &mut sink) {
                     eprintln!("telescope runtime error: {error}");
@@ -892,6 +901,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         request,
                         &agent_panes,
                         &assistant_cli_panes,
+                        current_surface,
                     ) {
                         Ok(pane) => {
                             assistant_cli_panes.push(pane);
@@ -909,6 +919,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         &browser_tabs,
                         &agent_panes,
                         &assistant_cli_panes,
+                        current_surface,
                     ) {
                         eprintln!("telescope workspace layout error: {error}");
                     }
@@ -935,11 +946,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             Event::WindowEvent {
                 window_id,
-                event: WindowEvent::Resized(_),
+                event: WindowEvent::Resized(size),
                 ..
             } if window_id == window.id() => {
+                current_surface = workspace_surface(size);
+                workspace_host.resize(current_surface);
                 if let Err(error) =
-                    set_webview_bounds(&chrome_webview, chrome_bounds_for_window(&window))
+                    set_webview_bounds(&chrome_webview, chrome_bounds_for_surface(current_surface))
                 {
                     eprintln!("telescope chrome layout error: {error}");
                 }
@@ -951,6 +964,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     &browser_tabs,
                     &agent_panes,
                     &assistant_cli_panes,
+                    current_surface,
                 ) {
                     eprintln!("telescope workspace layout error: {error}");
                 }
@@ -1322,6 +1336,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         request: PendingAssistantCliOpen,
         agent_panes: &[AgentPaneView],
         assistant_cli_panes: &[AssistantCliPaneView],
+        surface: WorkspaceSurface,
     ) -> RuntimeResult<AssistantCliPaneView> {
         let pane_id = manager
             .lock()
@@ -1332,14 +1347,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             })?
             .open_session(&request.command);
         let bounds = layout_for_new_cli_pane(
-            window,
+            surface,
             agent_panes,
             assistant_cli_panes,
             &pane_id,
             request.position.clone(),
         )
         .pane_bounds(&pane_id)
-        .unwrap_or_else(|| workspace_surface(window.inner_size()).into());
+        .unwrap_or_else(|| surface.into());
         let plane_for_ipc = plane.clone();
         let manager_for_ipc = manager.clone();
         let pending_closes_for_ipc = pending_closes.clone();
@@ -1500,7 +1515,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     fn layout_for_new_cli_pane(
-        window: &Window,
+        surface: WorkspaceSurface,
         agent_panes: &[AgentPaneView],
         assistant_cli_panes: &[AssistantCliPaneView],
         pane_id: &str,
@@ -1511,7 +1526,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             id: pane_id.to_string(),
             position,
         });
-        compute_desktop_layout(workspace_surface(window.inner_size()), panes).workspace
+        compute_desktop_layout(surface, panes).workspace
     }
 
     fn build_browser_tab_webview(
@@ -1536,6 +1551,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     fn layout_for_new_pane(
         window: &Window,
+        surface: WorkspaceSurface,
         agent_panes: &[AgentPaneView],
         assistant_cli_panes: &[AssistantCliPaneView],
         pane: &AgentPaneState,
@@ -1545,7 +1561,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             id: pane.id.clone(),
             position: pane.position.clone(),
         });
-        compute_desktop_layout(workspace_surface(window.inner_size()), panes).workspace
+        let _ = window;
+        compute_desktop_layout(surface, panes).workspace
     }
 
     fn relayout_workspace(
@@ -1556,9 +1573,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         browser_tabs: &[BrowserTabView],
         agent_panes: &[AgentPaneView],
         assistant_cli_panes: &[AssistantCliPaneView],
+        surface: WorkspaceSurface,
     ) -> RuntimeResult<()> {
+        let _ = window;
         let layout = compute_desktop_layout(
-            workspace_surface(window.inner_size()),
+            surface,
             pane_layout_inputs(agent_panes, assistant_cli_panes),
         )
         .workspace;
@@ -1591,12 +1610,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     fn browser_bounds_for_tabs(
-        window: &Window,
+        surface: WorkspaceSurface,
         agent_panes: &[AgentPaneView],
         assistant_cli_panes: &[AssistantCliPaneView],
     ) -> WorkspaceRect {
         compute_desktop_layout(
-            workspace_surface(window.inner_size()),
+            surface,
             pane_layout_inputs(agent_panes, assistant_cli_panes),
         )
         .workspace
@@ -1644,8 +1663,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .map_err(|err| telescope_runtime::RuntimeError::Adapter(err.to_string()))
     }
 
-    fn chrome_bounds_for_window(window: &Window) -> WorkspaceRect {
-        compute_desktop_layout(workspace_surface(window.inner_size()), Vec::new()).chrome
+    fn chrome_bounds_for_surface(surface: WorkspaceSurface) -> WorkspaceRect {
+        compute_desktop_layout(surface, Vec::new()).chrome
     }
 
     fn sync_chrome_state(plane: &ControlPlane, chrome_webview: &WebView, active_tab_id: &str) {
@@ -3980,6 +3999,8 @@ impl DesktopWorkspaceHost {
             use tao::platform::unix::WindowExtUnix;
 
             let fixed = gtk::Fixed::new();
+            fixed.set_hexpand(true);
+            fixed.set_vexpand(true);
             fixed.show_all();
             let vbox = window
                 .default_vbox()
@@ -3992,6 +4013,22 @@ impl DesktopWorkspaceHost {
         {
             let _ = window;
             Ok(Self {})
+        }
+    }
+
+    fn resize(&self, surface: WorkspaceSurface) {
+        #[cfg(target_os = "linux")]
+        {
+            use gtk::prelude::*;
+
+            self.fixed
+                .set_size_request(surface.width as i32, surface.height as i32);
+            self.fixed.queue_resize();
+        }
+
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = surface;
         }
     }
 }
